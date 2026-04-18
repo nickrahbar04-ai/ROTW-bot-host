@@ -1,0 +1,5 @@
+.env
+rotw.db
+rotw_preview.json
+.vscode/
+__pycache__/
