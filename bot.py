@@ -336,6 +336,7 @@ async def fetch_all_records(
 async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
     ajet_routes = []
     codeshare_routes = []
+    print("=== FETCHING ROUTES STARTED ===")
 
     async with aiohttp.ClientSession() as session:
         # Fetch AJet
@@ -357,19 +358,10 @@ async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
         # Auto-discover codeshare tables
         discovered_codeshare_tables = await fetch_codeshare_tables(session)
 
-        codeshare_fields = [
-            "Flight Number",
-            "Departure ICAO",
-            "Departure Airport",
-            "Arrival ICAO",
-            "Arrival Airport",
-            "Aircraft",
-            "Flighttime",
-        ]
-
         for table in discovered_codeshare_tables:
             partner_name = table["partner"]
             table_name = table["name"]
+            print("PROCESSING TABLE:", table_name)
 
             records = await fetch_all_records(session, table_name, codeshare_fields)
 
@@ -377,7 +369,7 @@ async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
                 route = normalize_codeshare(record, partner_name)
                 if is_valid_route(route):
                     codeshare_routes.append(route)
-
+    print("=== FETCHING CODESHARES ===")
     return ajet_routes, codeshare_routes
 
 async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
