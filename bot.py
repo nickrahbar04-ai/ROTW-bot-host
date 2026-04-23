@@ -11,8 +11,27 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+import os
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable")
+
+import os
 from dotenv import load_dotenv
 
+load_dotenv()
+
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
+AIRTABLE_BASE_ID_AJET = os.getenv("AIRTABLE_BASE_ID_AJET")
+AIRTABLE_BASE_ID_CODESHARE = os.getenv("AIRTABLE_BASE_ID_CODESHARE")
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+ROTW_CHANNEL_ID = int(os.getenv("ROTW_CHANNEL_ID", "0"))
+
+if not DISCORD_TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 # ----------------------------
 # Setup
 # ----------------------------
@@ -44,12 +63,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Change these to your real table names
 AJET_TABLE = "AJet Route Table"
 
-CODESHARE_TABLES = {
-    "Ryanair Virtual": "Ryanair Virtual Routes",
-    "Riyadh Air Virtual": "Riyadh Air Virtual Routes",
-    "Qatari Virtual": "Qatari Virtual Routes",
-    "LATAM Virtual": "LATOUR Virtual Routes",
-    "ITA Airways Virtual": "ITA Airways Virtual Routes",
+CODESHARE_REQUIRED_FIELDS = {
+    "Flight Number",
+    "Departure ICAO",
+    "Departure Airport",
+    "Arrival ICAO",
+    "Arrival Airport",
+    "Aircraft",
+    "Flighttime",
 }
 
 DB_PATH = "rotw.db"
@@ -260,7 +281,7 @@ def current_week_range_text() -> str:
     return (
         f"**Monday {monday.strftime('%d.%m.%y')} → Sunday {sunday.strftime('%d.%m.%y')}**\n"
         f"**00:00 → 23:59**"
-    )
+    ) 
     
 
 
@@ -317,6 +338,7 @@ async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
     codeshare_routes = []
 
     async with aiohttp.ClientSession() as session:
+        # Fetch AJet
         ajet_fields = [
             "Route Number",
             "Origin (IATA/ICAO)",
@@ -332,26 +354,68 @@ async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
             if is_valid_route(route):
                 ajet_routes.append(route)
 
+        # Auto-discover codeshare tables
+        discovered_codeshare_tables = await fetch_codeshare_tables(session)
+
         codeshare_fields = [
             "Flight Number",
             "Departure ICAO",
-            "Daperture Airport",
+            "Departure Airport",
             "Arrival ICAO",
             "Arrival Airport",
             "Aircraft",
             "Flighttime",
         ]
 
-        for partner_name, table_name in CODESHARE_TABLES.items():
+        for table in discovered_codeshare_tables:
+            partner_name = table["partner"]
+            table_name = table["name"]
+
             records = await fetch_all_records(session, table_name, codeshare_fields)
 
-            for i, record in enumerate(records):
+            for record in records:
                 route = normalize_codeshare(record, partner_name)
-
                 if is_valid_route(route):
                     codeshare_routes.append(route)
 
     return ajet_routes, codeshare_routes
+
+async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    Uses Airtable metadata API to discover all tables in the codeshare base.
+    Only returns tables that match the expected codeshare route format.
+    """
+    url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID_CODESHARE}/tables"
+    headers = {
+        "Authorization": f"Bearer {AIRTABLE_TOKEN}"
+    }
+
+    async with session.get(url, headers=headers) as response:
+        if response.status != 200:
+            text = await response.text()
+            raise RuntimeError(
+                f"Failed to fetch codeshare table metadata: {response.status} {text}"
+            )
+
+        data = await response.json()
+
+    valid_tables = []
+
+    for table in data.get("tables", []):
+        table_name = table.get("name", "")
+        fields = table.get("fields", [])
+        field_names = {field.get("name", "") for field in fields}
+
+        print("TABLE:", table_name)
+        print("FIELDS:", field_names)
+
+        if CODESHARE_REQUIRED_FIELDS.issubset(field_names):
+            valid_tables.append({
+                "name": table_name,
+                "partner": table_name.replace(" Routes", "").strip()
+            })
+    print("DISCOVERED CODESHARE TABLES:", [t["name"] for t in valid_tables])
+    return valid_tables
 
 
 # ----------------------------
@@ -405,7 +469,6 @@ def normalize_codeshare(record: dict, partner_name: str) -> dict:
         "remarks": None,
         "route_key": build_route_key(departure_icao, arrival_icao),
     }
-
 # ----------------------------
 # Selection logic
 # ----------------------------
