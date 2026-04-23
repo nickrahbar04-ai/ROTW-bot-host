@@ -11,27 +11,8 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
-import os
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
-if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN environment variable")
-
-import os
 from dotenv import load_dotenv
 
-load_dotenv()
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
-AIRTABLE_BASE_ID_AJET = os.getenv("AIRTABLE_BASE_ID_AJET")
-AIRTABLE_BASE_ID_CODESHARE = os.getenv("AIRTABLE_BASE_ID_CODESHARE")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-ROTW_CHANNEL_ID = int(os.getenv("ROTW_CHANNEL_ID", "0"))
-
-if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN environment variable")
 # ----------------------------
 # Setup
 # ----------------------------
@@ -46,13 +27,13 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 ROTW_CHANNEL_ID = int(os.getenv("ROTW_CHANNEL_ID", "0"))
 
 if not DISCORD_TOKEN:
-    raise RuntimeError("Missing DISCORD_TOKEN in .env")
+    raise RuntimeError("Missing DISCORD_TOKEN")
 if not AIRTABLE_TOKEN:
-    raise RuntimeError("Missing AIRTABLE_TOKEN in .env")
+    raise RuntimeError("Missing AIRTABLE_TOKEN")
 if not AIRTABLE_BASE_ID_AJET:
-    raise RuntimeError("Missing AIRTABLE_BASE_ID_AJET in .env")
+    raise RuntimeError("Missing AIRTABLE_BASE_ID_AJET")
 if not AIRTABLE_BASE_ID_CODESHARE:
-    raise RuntimeError("Missing AIRTABLE_BASE_ID_CODESHARE in .env")
+    raise RuntimeError("Missing AIRTABLE_BASE_ID_CODESHARE")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rotw_bot")
@@ -70,7 +51,7 @@ CODESHARE_REQUIRED_FIELDS = {
     "Arrival ICAO",
     "Arrival Airport",
     "Aircraft",
-    "Flighttime",
+    "Flightttime",
 }
 
 DB_PATH = "rotw.db"
@@ -296,8 +277,8 @@ async def fetch_all_records(
 ) -> list[dict]:
 
     url = get_base_url(table_name)
-    print("FETCHING TABLE:", table_name)
-    print("FETCHING URL:", url)
+    logger.info("FETCHING TABLE: %s", table_name)
+    logger.info("FETCHING URL: %s", url)
 
     records = []
     offset = None
@@ -336,10 +317,10 @@ async def fetch_all_records(
 async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
     ajet_routes = []
     codeshare_routes = []
-    print("=== FETCHING ROUTES STARTED ===")
+
+    logger.info("=== FETCHING ROUTES STARTED ===")
 
     async with aiohttp.ClientSession() as session:
-        # Fetch AJet
         ajet_fields = [
             "Route Number",
             "Origin (IATA/ICAO)",
@@ -355,13 +336,35 @@ async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
             if is_valid_route(route):
                 ajet_routes.append(route)
 
-        # Auto-discover codeshare tables
+        logger.info("=== FETCHING CODESHARES ===")
+
         discovered_codeshare_tables = await fetch_codeshare_tables(session)
+
 
         for table in discovered_codeshare_tables:
             partner_name = table["partner"]
             table_name = table["name"]
-            print("PROCESSING TABLE:", table_name)
+            field_names = table["field_names"]
+
+            logger.info("PROCESSING TABLE: %s", table_name)
+
+            codeshare_fields = [
+                "Flight Number",
+                "Departure ICAO",
+                "Arrival ICAO",
+                "Arrival Airport",
+                "Aircraft",
+            ]
+
+            if "Departure Airport" in field_names:
+                codeshare_fields.append("Departure Airport")
+            elif "Daperture Airport" in field_names:
+                codeshare_fields.append("Daperture Airport")
+
+            if "Flighttime" in field_names:
+                codeshare_fields.append("Flighttime")
+            elif "Flightttime" in field_names:
+                codeshare_fields.append("Flightttime")
 
             records = await fetch_all_records(session, table_name, codeshare_fields)
 
@@ -369,14 +372,13 @@ async def fetch_all_routes() -> tuple[list[dict], list[dict]]:
                 route = normalize_codeshare(record, partner_name)
                 if is_valid_route(route):
                     codeshare_routes.append(route)
-    print("=== FETCHING CODESHARES ===")
+
+        logger.info("AJET ROUTES: %s", len(ajet_routes))
+        logger.info("CODESHARE ROUTES: %s", len(codeshare_routes))
+
     return ajet_routes, codeshare_routes
 
 async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
-    """
-    Uses Airtable metadata API to discover all tables in the codeshare base.
-    Only returns tables that match the expected codeshare route format.
-    """
     url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID_CODESHARE}/tables"
     headers = {
         "Authorization": f"Bearer {AIRTABLE_TOKEN}"
@@ -398,17 +400,29 @@ async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
         fields = table.get("fields", [])
         field_names = {field.get("name", "") for field in fields}
 
-        print("TABLE:", table_name)
-        print("FIELDS:", field_names)
+        logger.info("TABLE: %s", table_name)
+        logger.info("FIELDS: %s", field_names)
 
-        if CODESHARE_REQUIRED_FIELDS.issubset(field_names):
+        required_base_fields = {
+            "Flight Number",
+            "Departure ICAO",
+            "Arrival ICAO",
+            "Arrival Airport",
+            "Aircraft",
+        }
+
+        has_departure_airport = "Departure Airport" in field_names or "Daperture Airport" in field_names
+        has_time_field = "Flighttime" in field_names or "Flightttime" in field_names
+
+        if required_base_fields.issubset(field_names) and has_departure_airport and has_time_field:
             valid_tables.append({
                 "name": table_name,
-                "partner": table_name.replace(" Routes", "").strip()
+                "partner": table_name.replace(" Routes", "").strip(),
+                "field_names": field_names,
             })
-    print("DISCOVERED CODESHARE TABLES:", [t["name"] for t in valid_tables])
-    return valid_tables
 
+    logger.info("DISCOVERED CODESHARE TABLES: %s", [t["name"] for t in valid_tables])
+    return valid_tables
 
 # ----------------------------
 # Normalizers
@@ -454,10 +468,10 @@ def normalize_codeshare(record: dict, partner_name: str) -> dict:
         "arrival_code": arrival_icao,
         "departure_icao": departure_icao,
         "arrival_icao": arrival_icao,
-        "departure_airport": normalize_text(fields.get("Departure Airport")),
+        "departure_airport": normalize_text(fields.get("Departure Airport") or fields.get("Daperture Airport")),
         "arrival_airport": normalize_text(fields.get("Arrival Airport")),
         "aircraft": normalize_text(fields.get("Aircraft")),
-        "flight_time": normalize_text(fields.get("Flighttime")),
+        "flight_time": normalize_text(fields.get("Flighttime") or fields.get("Flightttime")),
         "remarks": None,
         "route_key": build_route_key(departure_icao, arrival_icao),
     }
