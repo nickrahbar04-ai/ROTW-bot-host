@@ -9,6 +9,7 @@ from collections import defaultdict
 
 import aiohttp
 import discord
+from discord import channel
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
@@ -708,7 +709,18 @@ async def rotw_post(interaction: discord.Interaction):
             return
 
         embed = format_rotw_embed(routes, week_start)
-        await channel.send(content="@everyone", embed=embed)
+        
+        ROTW_ROLE_ID = 1487578840577609738
+
+        msg = await channel.send(
+            content=f"<@&{ROTW_ROLE_ID}>",
+            embed=embed
+        )
+
+        await msg.add_reaction("🔥")
+        await msg.add_reaction("✈️")
+        await msg.add_reaction("❤️")
+
         save_rotw_history(week_start, routes)
 
         await interaction.followup.send("ROTW posted successfully.", ephemeral=True)
@@ -801,7 +813,17 @@ async def weekly_rotw_task():
             return
 
         embed = format_rotw_embed(routes, week_start)
-        await channel.send(embed=embed)
+        ROTW_ROLE_ID = 1487578840577609738
+
+        msg = await channel.send(
+            content=f"<@&{ROTW_ROLE_ID}>",
+            embed=embed
+        )
+
+        await msg.add_reaction("🔥")
+        await msg.add_reaction("✈️")
+        await msg.add_reaction("❤️")
+
         save_rotw_history(week_start, routes)
         logger.info("Automatically posted ROTW for %s", week_start)
 
