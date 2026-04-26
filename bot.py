@@ -708,7 +708,7 @@ async def rotw_post(interaction: discord.Interaction):
             return
 
         embed = format_rotw_embed(routes, week_start)
-        await channel.send(embed=embed)
+        await channel.send(content="@everyone", embed=embed)
         save_rotw_history(week_start, routes)
 
         await interaction.followup.send("ROTW posted successfully.", ephemeral=True)
