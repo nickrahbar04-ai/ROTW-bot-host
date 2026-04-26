@@ -256,13 +256,19 @@ def format_duration(seconds):
 def current_week_range_text() -> str:
     today = datetime.now().date()
 
-    monday = today - timedelta(days=today.weekday())
+    # Monday = 0, Sunday = 6
+    # If today is Sunday, show the NEXT Monday-Sunday week
+    if today.weekday() == 6:
+        monday = today + timedelta(days=1)
+    else:
+        monday = today - timedelta(days=today.weekday())
+
     sunday = monday + timedelta(days=6)
 
     return (
         f"**Monday {monday.strftime('%d.%m.%y')} → Sunday {sunday.strftime('%d.%m.%y')}**\n"
         f"**00:00 → 23:59**"
-    ) 
+    )
     
 
 
