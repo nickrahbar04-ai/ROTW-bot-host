@@ -270,6 +270,27 @@ def current_week_range_text() -> str:
         f"**Monday {monday.strftime('%d.%m.%y')} → Sunday {sunday.strftime('%d.%m.%y')}**\n"
         f"**00:00 → 23:59**"
     )
+
+def split_embed_field_lines(lines: list[str], max_length: int = 1024) -> list[str]:
+    chunks = []
+    current = ""
+
+    for line in lines:
+        # +1 for newline
+        if len(current) + len(line) + 1 > max_length:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            if current:
+                current += "\n" + line
+            else:
+                current = line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
     
 
 
@@ -596,15 +617,37 @@ def format_rotw_embed(routes: list[dict], week_start: str) -> discord.Embed:
 
         codeshare_lines.append("")
 
+    # AJet fields
+ajet_chunks = split_embed_field_lines(ajet_lines)
+
+if ajet_chunks:
+    for i, chunk in enumerate(ajet_chunks):
+        embed.add_field(
+            name="AJet Virtual" if i == 0 else "AJet Virtual Continued",
+            value=chunk,
+            inline=False
+        )
+else:
     embed.add_field(
         name="AJet Virtual",
-        value="\n".join(ajet_lines) if ajet_lines else "No routes selected.",
+        value="No routes selected.",
         inline=False
     )
 
+# Codeshare fields
+codeshare_chunks = split_embed_field_lines(codeshare_lines)
+
+if codeshare_chunks:
+    for i, chunk in enumerate(codeshare_chunks):
+        embed.add_field(
+            name="Codeshare Partners" if i == 0 else "Codeshare Partners Continued",
+            value=chunk,
+            inline=False
+        )
+else:
     embed.add_field(
         name="Codeshare Partners",
-        value="\n".join(codeshare_lines) if codeshare_lines else "No routes selected.",
+        value="No routes selected.",
         inline=False
     )
 
