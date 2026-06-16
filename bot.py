@@ -618,38 +618,38 @@ def format_rotw_embed(routes: list[dict], week_start: str) -> discord.Embed:
         codeshare_lines.append("")
 
     # AJet fields
-ajet_chunks = split_embed_field_lines(ajet_lines)
+    ajet_chunks = split_embed_field_lines(ajet_lines)
 
-if ajet_chunks:
-    for i, chunk in enumerate(ajet_chunks):
+    if ajet_chunks:
+        for i, chunk in enumerate(ajet_chunks):
+            embed.add_field(
+                name="AJet Virtual" if i == 0 else "AJet Virtual Continued",
+                value=chunk,
+                inline=False
+            )
+    else:
         embed.add_field(
-            name="AJet Virtual" if i == 0 else "AJet Virtual Continued",
-            value=chunk,
+            name="AJet Virtual",
+            value="No routes selected.",
             inline=False
-        )
-else:
-    embed.add_field(
-        name="AJet Virtual",
-        value="No routes selected.",
-        inline=False
     )
 
 # Codeshare fields
-codeshare_chunks = split_embed_field_lines(codeshare_lines)
+    codeshare_chunks = split_embed_field_lines(codeshare_lines)
 
-if codeshare_chunks:
-    for i, chunk in enumerate(codeshare_chunks):
+    if codeshare_chunks:
+        for i, chunk in enumerate(codeshare_chunks):
+            embed.add_field(
+                name="Codeshare Partners" if i == 0 else "Codeshare Partners Continued",
+                value=chunk,
+                inline=False
+            )
+    else:
         embed.add_field(
-            name="Codeshare Partners" if i == 0 else "Codeshare Partners Continued",
-            value=chunk,
+            name="Codeshare Partners",
+            value="No routes selected.",
             inline=False
         )
-else:
-    embed.add_field(
-        name="Codeshare Partners",
-        value="No routes selected.",
-        inline=False
-    )
 
     embed.set_footer(text="Generated automatically from Airtable")
     return embed
