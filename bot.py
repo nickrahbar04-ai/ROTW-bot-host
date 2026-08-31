@@ -9,7 +9,6 @@ from collections import defaultdict
 
 import aiohttp
 import discord
-from discord import channel
 from discord.ext import commands, tasks
 from discord import app_commands
 from dotenv import load_dotenv
@@ -26,6 +25,7 @@ AIRTABLE_BASE_ID_AJET = os.getenv("AIRTABLE_BASE_ID_AJET")
 AIRTABLE_BASE_ID_CODESHARE = os.getenv("AIRTABLE_BASE_ID_CODESHARE")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 ROTW_CHANNEL_ID = int(os.getenv("ROTW_CHANNEL_ID", "0"))
+ROTW_ROLE_ID = int(os.getenv("ROTW_ROLE_ID", "0"))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
@@ -45,15 +45,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Change these to your real table names
 AJET_TABLE = "AJet Route Table"
 
-CODESHARE_REQUIRED_FIELDS = {
-    "Flight Number",
-    "Departure ICAO",
-    "Departure Airport",
-    "Arrival ICAO",
-    "Arrival Airport",
-    "Aircraft",
-    "Flightttime",
-}
 
 DB_PATH = "rotw.db"
 
@@ -195,11 +186,6 @@ def get_last_history(limit: int = 20) -> list[tuple]:
 # Helpers
 # ----------------------------
 
-def sunday_of_current_week() -> str:
-    now = datetime.now(timezone.utc).date()
-    days_since_sunday = (now.weekday() + 1) % 7
-    sunday = now - timedelta(days=days_since_sunday)
-    return sunday.isoformat()
 
 
 def normalize_text(value) -> str:
@@ -251,11 +237,31 @@ def format_duration(seconds):
         hours = seconds // 3600
         minutes = (seconds % 3600) // 60
         return f"{hours}:{minutes:02d}"
-    except:
+    except (TypeError, ValueError):
         return seconds
 
-def current_week_range_text() -> str:
-    today = datetime.now().date()
+def target_week_start() -> str:
+    today = datetime.now(timezone.utc).date()
+
+    # Monday = 0, Sunday = 6
+    # On Sunday, ROTW is for the upcoming Monday-Sunday week.
+    if today.weekday() == 6:
+        monday = today + timedelta(days=1)
+    else:
+        monday = today - timedelta(days=today.weekday())
+
+    return monday.isoformat()
+
+
+def week_range_text(week_start: str) -> str:
+    monday = datetime.strptime(week_start, "%Y-%m-%d").date()
+    sunday = monday + timedelta(days=6)
+
+    return (
+        f"**Monday {monday.strftime('%d.%m.%y')} → "
+        f"Sunday {sunday.strftime('%d.%m.%y')}**\n"
+        f"**00:00 → 23:59**"
+    )
 
     # Monday = 0, Sunday = 6
     # If today is Sunday, show the NEXT Monday-Sunday week
@@ -439,17 +445,61 @@ async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
             "Aircraft",
         }
 
-        has_departure_airport = "Departure Airport" in field_names or "Daperture Airport" in field_names
-        has_time_field = "Flighttime" in field_names or "Flightttime" in field_names
+        missing_fields = required_base_fields - field_names
 
-        if required_base_fields.issubset(field_names) and has_departure_airport and has_time_field:
-            valid_tables.append({
-                "name": table_name,
-                "partner": table_name.replace(" Routes", "").strip(),
-                "field_names": field_names,
-            })
+        has_departure_airport = (
+            "Departure Airport" in field_names
+            or "Daperture Airport" in field_names
+        )
 
-    logger.info("DISCOVERED CODESHARE TABLES: %s", [t["name"] for t in valid_tables])
+        has_time_field = (
+            "Flighttime" in field_names
+            or "Flightttime" in field_names
+        )
+
+        if missing_fields:
+            logger.warning(
+                "SKIPPING TABLE '%s' - missing required fields: %s",
+                table_name,
+                ", ".join(sorted(missing_fields)),
+            )
+            continue
+
+        if not has_departure_airport:
+            logger.warning(
+                "SKIPPING TABLE '%s' - missing Departure Airport field",
+                table_name,
+            )
+            continue
+
+        if not has_time_field:
+            logger.warning(
+                "SKIPPING TABLE '%s' - missing Flighttime field",
+                table_name,
+            )
+            continue
+
+        valid_tables.append({
+            "name": table_name,
+            "partner": table_name.replace(" Routes", "").strip(),
+            "field_names": field_names,
+        })
+
+        logger.info(
+            "VALID CODESHARE TABLE: %s",
+            table_name,
+        )
+
+        logger.info(
+        "CODESHARE DISCOVERY COMPLETE: %d valid tables",
+        len(valid_tables),
+        )
+
+        logger.info(
+        "VALID CODESHARE TABLES: %s",
+        [table["name"] for table in valid_tables],
+        )
+
     return valid_tables
 
 # ----------------------------
@@ -570,7 +620,7 @@ def pick_rotw_routes(
 def format_rotw_embed(routes: list[dict], week_start: str) -> discord.Embed:
     embed = discord.Embed(
         title="✈️ Route of the Week",
-        description=current_week_range_text(),
+        description=week_range_text(week_start),
         color=discord.Color.blue(),
     )
 
@@ -671,8 +721,38 @@ async def generate_rotw() -> tuple[list[dict], str]:
         recent_keys=recent_keys,
     )
 
-    week_start = sunday_of_current_week()
+    week_start = target_week_start()
     return routes, week_start
+
+
+async def publish_rotw(
+    channel: discord.abc.Messageable,
+    routes: list[dict],
+    week_start: str,
+) -> discord.Message:
+    embed = format_rotw_embed(routes, week_start)
+
+    content = f"<@&{ROTW_ROLE_ID}>" if ROTW_ROLE_ID else None
+
+    msg = await channel.send(
+        content=content,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(
+            roles=True,
+            everyone=False,
+            users=False,
+        ),
+    )
+
+    for reaction in ("🔥", "✈️", "❤️"):
+        try:
+            await msg.add_reaction(reaction)
+        except discord.HTTPException:
+            logger.warning("Failed to add reaction %s", reaction)
+
+    save_rotw_history(week_start, routes)
+
+    return msg
 
 
 # ----------------------------
@@ -751,20 +831,7 @@ async def rotw_post(interaction: discord.Interaction):
             )
             return
 
-        embed = format_rotw_embed(routes, week_start)
-        
-        ROTW_ROLE_ID = 1487578840577609738
-
-        msg = await channel.send(
-            content=f"<@&{ROTW_ROLE_ID}>",
-            embed=embed
-        )
-
-        await msg.add_reaction("🔥")
-        await msg.add_reaction("✈️")
-        await msg.add_reaction("❤️")
-
-        save_rotw_history(week_start, routes)
+        await publish_rotw(channel, routes, week_start)
 
         await interaction.followup.send("ROTW posted successfully.", ephemeral=True)
 
@@ -833,7 +900,7 @@ async def weekly_rotw_task():
     if now.hour != 9:
         return
 
-    week_start = sunday_of_current_week()
+    week_start = target_week_start()
 
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
@@ -855,19 +922,8 @@ async def weekly_rotw_task():
             logger.warning("ROTW channel not found")
             return
 
-        embed = format_rotw_embed(routes, week_start)
-        ROTW_ROLE_ID = 1487578840577609738
+        await publish_rotw(channel, routes, week_start)
 
-        msg = await channel.send(
-            content=f"<@&{ROTW_ROLE_ID}>",
-            embed=embed
-        )
-
-        await msg.add_reaction("🔥")
-        await msg.add_reaction("✈️")
-        await msg.add_reaction("❤️")
-
-        save_rotw_history(week_start, routes)
         logger.info("Automatically posted ROTW for %s", week_start)
 
     except Exception:
