@@ -26,6 +26,7 @@ AIRTABLE_BASE_ID_CODESHARE = os.getenv("AIRTABLE_BASE_ID_CODESHARE")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 ROTW_CHANNEL_ID = int(os.getenv("ROTW_CHANNEL_ID", "0"))
 ROTW_ROLE_ID = int(os.getenv("ROTW_ROLE_ID", "0"))
+ROTW_STAFF_ROLE_ID = int(os.getenv("ROTW_STAFF_ROLE_ID", "0"))
 
 if not DISCORD_TOKEN:
     raise RuntimeError("Missing DISCORD_TOKEN")
@@ -186,6 +187,58 @@ def get_last_history(limit: int = 20) -> list[tuple]:
 # Helpers
 # ----------------------------
 
+def get_rotw_preview_summary(routes: list[dict]) -> str:
+    ajet_count = 0
+    codeshare_count = 0
+    partners = set()
+
+    for route in routes:
+        source = route.get("source", "").lower()
+
+        if source == "ajet":
+            ajet_count += 1
+        elif source == "codeshare":
+            codeshare_count += 1
+
+            partner = route.get("partner")
+            if partner:
+                partners.add(partner)
+
+    return (
+        f"✈️ **AJet routes:** {ajet_count}\n"
+        f"🤝 **Codeshare routes:** {codeshare_count}\n"
+        f"🌐 **Codeshare partners:** {len(partners)}"
+    )
+
+
+def has_rotw_staff_access(interaction: discord.Interaction) -> bool:
+    if ROTW_STAFF_ROLE_ID == 0:
+        return False
+
+    member = interaction.user
+
+    if not isinstance(member, discord.Member):
+        return False
+
+    return any(role.id == ROTW_STAFF_ROLE_ID for role in member.roles)
+
+
+async def require_rotw_staff(interaction: discord.Interaction) -> bool:
+    if has_rotw_staff_access(interaction):
+        return True
+
+    if interaction.response.is_done():
+        await interaction.followup.send(
+            "You do not have permission to use this ROTW management command.",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "You do not have permission to use this ROTW management command.",
+            ephemeral=True,
+        )
+
+    return False
 
 
 def normalize_text(value) -> str:
@@ -502,6 +555,102 @@ async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
 
     return valid_tables
 
+
+
+class ROTWPreviewView(discord.ui.View):
+    def __init__(self, routes: list[dict], week_start: str):
+        super().__init__(timeout=600)
+        self.routes = routes
+        self.week_start = week_start
+
+    @discord.ui.button(
+        label="Post ROTW",
+        style=discord.ButtonStyle.green,
+        emoji="✅",
+    )
+    async def post_rotw_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not await require_rotw_staff(interaction):
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            channel = bot.get_channel(ROTW_CHANNEL_ID)
+
+            if channel is None:
+                await interaction.followup.send(
+                    "Unable to find the ROTW channel.",
+                    ephemeral=True,
+                )
+                return
+
+            await publish_rotw(
+                channel,
+                self.routes,
+                self.week_start,
+            )
+
+            await interaction.followup.send(
+                "ROTW posted successfully.",
+                ephemeral=True,
+            )
+
+        except Exception as e:
+            logger.exception("Error posting ROTW from preview")
+
+            await interaction.followup.send(
+                f"Unable to post ROTW: `{e}`",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(
+        label="Regenerate Preview",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔄",
+    )
+    async def regenerate_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not await require_rotw_staff(interaction):
+            return
+
+        await interaction.response.defer()
+
+        try:
+            routes, week_start = await generate_rotw()
+
+            self.routes = routes
+            self.week_start = week_start
+
+            embed = format_rotw_embed(routes, week_start)
+
+            embed.insert_field_at(
+                0,
+                name="📊 Preview Summary",
+                value=get_rotw_preview_summary(routes),
+                inline=False,
+            )
+
+            await interaction.edit_original_response(
+                content="Generated a new ROTW preview.",
+                embed=embed,
+                view=self,
+            )
+
+        except Exception as e:
+            logger.exception("Error regenerating ROTW preview")
+
+            await interaction.followup.send(
+                f"Unable to regenerate preview: `{e}`",
+                ephemeral=True,
+            )
+
 # ----------------------------
 # Normalizers
 # ----------------------------
@@ -724,7 +873,6 @@ async def generate_rotw() -> tuple[list[dict], str]:
     week_start = target_week_start()
     return routes, week_start
 
-
 async def publish_rotw(
     channel: discord.abc.Messageable,
     routes: list[dict],
@@ -781,11 +929,21 @@ async def on_ready():
 
 @bot.tree.command(name="rotw_generate", description="Generate a new ROTW preview")
 async def rotw_generate(interaction: discord.Interaction):
+    if not await require_rotw_staff(interaction):
+        return
+
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     try:
         routes, week_start = await generate_rotw()
         embed = format_rotw_embed(routes, week_start)
+
+        embed.insert_field_at(
+            0,
+            name="📊 Preview Summary",
+            value=get_rotw_preview_summary(routes),
+            inline=False,
+        )
 
         preview_data = {
             "week_start": week_start,
@@ -797,6 +955,7 @@ async def rotw_generate(interaction: discord.Interaction):
         await interaction.followup.send(
             "Generated a new ROTW preview.",
             embed=embed,
+            view=ROTWPreviewView(routes, week_start),
             ephemeral=True,
         )
 
@@ -807,6 +966,8 @@ async def rotw_generate(interaction: discord.Interaction):
 
 @bot.tree.command(name="rotw_post", description="Post the current ROTW preview to the configured channel")
 async def rotw_post(interaction: discord.Interaction):
+    if not await require_rotw_staff(interaction):
+        return
     await interaction.response.defer(thinking=True, ephemeral=True)
 
     try:
@@ -833,7 +994,11 @@ async def rotw_post(interaction: discord.Interaction):
 
         await publish_rotw(channel, routes, week_start)
 
-        await interaction.followup.send("ROTW posted successfully.", ephemeral=True)
+        await interaction.followup.send("Generated a new ROTW preview.",
+            embed=embed,
+            view=ROTWPreviewView(),
+            ephemeral=True
+        )
 
     except Exception as e:
         logger.exception("Error posting ROTW")
@@ -856,6 +1021,94 @@ async def rotw_history(interaction: discord.Interaction):
 
     await interaction.response.send_message("\n".join(lines[:15]), ephemeral=True)
 
+@bot.tree.command(
+    name="rotw_status",
+    description="Show ROTW bot status, route counts and configuration"
+)
+async def rotw_status(interaction: discord.Interaction):
+    if not await require_rotw_staff(interaction):
+        return 
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+
+    try:
+        config = get_config()
+        week_start = target_week_start()
+
+        ajet_routes, codeshare_routes = await fetch_all_routes()
+
+        ajet_routes = deduplicate_routes(ajet_routes)
+        codeshare_routes = deduplicate_routes(codeshare_routes)
+
+        partner_counts = defaultdict(int)
+
+        for route in codeshare_routes:
+            partner_counts[route["partner"]] += 1
+
+        embed = discord.Embed(
+            title="🛠️ AJet ROTW Bot Status",
+            description=week_range_text(week_start),
+            color=discord.Color.green(),
+        )
+
+        embed.add_field(
+            name="✈️ Route Database",
+            value=(
+                f"**AJet routes:** {len(ajet_routes)}\n"
+                f"**Codeshare routes:** {len(codeshare_routes)}\n"
+                f"**Codeshare partners:** {len(partner_counts)}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="⚙️ Current Configuration",
+            value=(
+                f"**AJet selections:** {config['ajet_count']}\n"
+                f"**Codeshare selections:** {config['codeshare_count']}\n"
+                f"**Repeat protection:** {config['recent_weeks_block']} weeks"
+            ),
+            inline=False,
+        )
+
+        partner_lines = [
+            f"**{partner}** — {count} routes"
+            for partner, count in sorted(partner_counts.items())
+        ]
+
+        partner_chunks = split_embed_field_lines(
+            partner_lines,
+            max_length=1000,
+        )
+
+        for i, chunk in enumerate(partner_chunks):
+            embed.add_field(
+                name=(
+                    "🤝 Codeshare Partners"
+                    if i == 0
+                    else "🤝 Codeshare Partners Continued"
+                ),
+                value=chunk,
+                inline=False,
+            )
+
+        embed.set_footer(
+            text="Live data retrieved from Airtable"
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    except Exception as e:
+        logger.exception("Error retrieving ROTW status")
+
+        await interaction.followup.send(
+            f"Unable to retrieve ROTW status: `{e}`",
+            ephemeral=True,
+        )
+
 
 @bot.tree.command(name="rotw_settings", description="Change route counts and duplicate block window")
 @app_commands.describe(
@@ -869,6 +1122,9 @@ async def rotw_settings(
     codeshare_count: int,
     recent_weeks_block: int,
 ):
+    if not await require_rotw_staff(interaction):
+        return
+    
     if ajet_count < 0 or codeshare_count < 0 or recent_weeks_block < 0:
         await interaction.response.send_message("Values must be 0 or higher.", ephemeral=True)
         return
