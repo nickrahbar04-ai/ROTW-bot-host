@@ -350,6 +350,26 @@ def split_embed_field_lines(lines: list[str], max_length: int = 1024) -> list[st
         chunks.append(current)
 
     return chunks
+
+def rotw_week_already_posted(week_start: str) -> bool:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT 1
+        FROM rotw_history
+        WHERE week_start = ?
+        LIMIT 1
+        """,
+        (week_start,),
+    )
+
+    exists = cursor.fetchone() is not None
+
+    conn.close()
+
+    return exists
     
 
 
@@ -556,12 +576,548 @@ async def fetch_codeshare_tables(session: aiohttp.ClientSession) -> list[dict]:
     return valid_tables
 
 
+async def get_single_reroll(
+    current_routes: list[dict],
+    route_index: int,
+    same_partner: bool = False,
+) -> dict | None:
+    old_route = current_routes[route_index]
+    source = old_route.get("source", "").lower()
+
+    ajet_routes, codeshare_routes = await fetch_all_routes()
+
+    if source == "ajet":
+        pool = deduplicate_routes(ajet_routes)
+
+    elif source == "codeshare":
+        pool = deduplicate_routes(codeshare_routes)
+
+        if same_partner:
+            old_partner = old_route.get("partner")
+
+            pool = [
+                route
+                for route in pool
+                if route.get("partner") == old_partner
+            ]
+
+    else:
+        return None
+
+    used_keys = {
+        route.get("route_key")
+        for route in current_routes
+        if route.get("route_key")
+    }
+
+    candidates = [
+        route
+        for route in pool
+        if route.get("route_key")
+        and route.get("route_key") not in used_keys
+    ]
+
+    if not candidates:
+        return None
+
+    return random.choice(candidates)
+
+
+class ROTWRouteSelect(discord.ui.Select):
+    def __init__(
+        self,
+        preview_view,
+        source: str,
+        placeholder: str,
+    ):
+        self.preview_view = preview_view
+        self.source = source
+
+        options = []
+
+        for index, route in enumerate(preview_view.routes):
+            if route.get("source", "").lower() != source:
+                continue
+
+            route_number = route.get("route_number", "Unknown")
+            departure = route.get("departure_code", "?")
+            arrival = route.get("arrival_code", "?")
+
+            if source == "codeshare":
+                partner = route.get("partner", "Codeshare")
+                description = f"{partner}: {departure} → {arrival}"
+            else:
+                description = f"{departure} → {arrival}"
+
+            options.append(
+                discord.SelectOption(
+                    label=str(route_number)[:100],
+                    description=description[:100],
+                    value=str(index),
+                )
+            )
+
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_rotw_staff(interaction):
+            return
+
+        await interaction.response.defer()
+
+        try:
+            # This is already the exact index inside preview_view.routes
+            route_index = int(self.values[0])
+
+            preview_view = self.preview_view
+            old_route = preview_view.routes[route_index]
+
+            # Safety check
+            if old_route.get("source", "").lower() != self.source:
+                await interaction.followup.send(
+                    "The selected route does not match this reroll category.",
+                    ephemeral=True,
+                )
+                return
+
+            # Get one eligible replacement route
+            new_route = await get_single_reroll(
+                preview_view.routes,
+                route_index,
+            )
+
+            if new_route is None:
+                await interaction.followup.send(
+                    "No alternative route could be found.",
+                    ephemeral=True,
+                )
+                return
+
+            # Replace ONLY the selected route
+            preview_view.routes[route_index] = new_route
+
+            # Save updated preview
+            preview_data = {
+                "week_start": preview_view.week_start,
+                "routes": preview_view.routes,
+            }
+
+            with open(
+                "rotw_preview.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    preview_data,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            # Rebuild preview embed
+            embed = format_rotw_embed(
+                preview_view.routes,
+                preview_view.week_start,
+            )
+
+            embed.insert_field_at(
+                0,
+                name="📊 Preview Summary",
+                value=get_rotw_preview_summary(preview_view.routes),
+                inline=False,
+            )
+
+            # Rebuild dropdowns using the updated route list
+            new_view = ROTWPreviewView(
+                preview_view.routes,
+                preview_view.week_start,
+            )
+
+            await interaction.edit_original_response(
+                embed=embed,
+                view=new_view,
+            )
+
+        except Exception as e:
+            logger.exception("Error rerolling individual ROTW route")
+
+            await interaction.followup.send(
+                f"Unable to reroll route: `{e}`",
+                ephemeral=True,
+            )
+
+
+class ROTWSamePartnerSelect(discord.ui.Select):
+    def __init__(
+        self,
+        preview_view,
+        placeholder: str,
+    ):
+        self.preview_view = preview_view
+
+        options = []
+
+        for index, route in enumerate(preview_view.routes):
+            if route.get("source", "").lower() != "codeshare":
+                continue
+
+            route_number = route.get("route_number", "Unknown")
+            departure = route.get("departure_code", "?")
+            arrival = route.get("arrival_code", "?")
+            partner = route.get("partner", "Codeshare")
+
+            options.append(
+                discord.SelectOption(
+                    label=str(route_number)[:100],
+                    description=f"{partner}: {departure} → {arrival}"[:100],
+                    value=str(index),
+                )
+            )
+
+        super().__init__(
+            placeholder=placeholder,
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_rotw_staff(interaction):
+            return
+
+        await interaction.response.defer()
+
+        try:
+            route_index = int(self.values[0])
+
+            preview_view = self.preview_view
+
+            new_route = await get_single_reroll(
+                preview_view.routes,
+                route_index,
+                same_partner=True,
+            )
+
+            if new_route is None:
+                await interaction.followup.send(
+                    "No alternative route from the same codeshare partner is available.",
+                    ephemeral=True,
+                )
+                return
+
+            preview_view.routes[route_index] = new_route
+
+            preview_data = {
+                "week_start": preview_view.week_start,
+                "routes": preview_view.routes,
+            }
+
+            with open(
+                "rotw_preview.json",
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump(
+                    preview_data,
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            embed = format_rotw_embed(
+                preview_view.routes,
+                preview_view.week_start,
+            )
+
+            embed.insert_field_at(
+                0,
+                name="📊 Preview Summary",
+                value=get_rotw_preview_summary(preview_view.routes),
+                inline=False,
+            )
+
+            new_view = ROTWPreviewView(
+                preview_view.routes,
+                preview_view.week_start,
+            )
+
+            await interaction.edit_original_response(
+                embed=embed,
+                view=new_view,
+            )
+
+        except Exception as e:
+            logger.exception(
+                "Error rerolling codeshare route with same partner"
+            )
+
+            await interaction.followup.send(
+                f"Unable to reroll route: `{e}`",
+                ephemeral=True,
+            )
+
+
+class ROTWLockSelect(discord.ui.Select):
+    def __init__(
+        self,
+        preview_view,
+        source: str,
+        placeholder: str,
+    ):
+        self.preview_view = preview_view
+        self.source = source
+
+        options = []
+
+        for index, route in enumerate(preview_view.routes):
+            if route.get("source", "").lower() != source:
+                continue
+
+            route_number = route.get("route_number", "Unknown")
+            departure = route.get("departure_code", "?")
+            arrival = route.get("arrival_code", "?")
+            partner = route.get("partner", "")
+
+            description = f"{departure} → {arrival}"
+
+            if source == "codeshare" and partner:
+                description = f"{partner}: {departure} → {arrival}"
+
+            is_locked = index in preview_view.locked_indices
+
+            options.append(
+                discord.SelectOption(
+                    label=str(route_number)[:100],
+                    description=description[:100],
+                    value=str(index),
+                    default=is_locked,
+                )
+            )
+
+        super().__init__(
+            placeholder=placeholder,
+            min_values=0,
+            max_values=len(options),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_rotw_staff(interaction):
+            return
+
+        selected_indices = {
+            int(value)
+            for value in self.values
+        }
+
+        if self.source == "ajet":
+            self.preview_view.locked_ajet_indices = selected_indices
+
+        elif self.source == "codeshare":
+            self.preview_view.locked_codeshare_indices = selected_indices
+
+        self.preview_view.locked_indices = (
+            self.preview_view.locked_ajet_indices
+            | self.preview_view.locked_codeshare_indices
+        )
+
+        await interaction.response.send_message(
+            f"🔒 Locked {len(self.preview_view.locked_indices)} route(s) total.",
+            ephemeral=True,
+        )
+
+        async def callback(self, interaction: discord.Interaction):
+            if not await require_rotw_staff(interaction):
+                return
+
+            selected_indices = {
+                int(value)
+                for value in self.values
+            }
+
+            if self.source == "ajet":
+                self.preview_view.locked_ajet_indices = selected_indices
+
+            elif self.source == "codeshare":
+                self.preview_view.locked_codeshare_indices = selected_indices
+
+            self.preview_view.locked_indices = (
+                self.preview_view.locked_ajet_indices
+                | self.preview_view.locked_codeshare_indices
+            )
+
+            await interaction.response.send_message(
+                f"🔒 Locked {len(self.preview_view.locked_indices)} route(s) total.",
+                ephemeral=True,
+            )
+
+
+class ROTWLockManagementView(discord.ui.View):
+    def __init__(self, preview_view):
+        super().__init__(timeout=600)
+
+        self.preview_view = preview_view
+
+        # AJet lock selector
+        self.add_item(
+            ROTWLockSelect(
+                preview_view,
+                source="ajet",
+                placeholder="🔒 Lock AJet Routes",
+            )
+        )
+
+        # Codeshare lock selector
+        self.add_item(
+            ROTWLockSelect(
+                preview_view,
+                source="codeshare",
+                placeholder="🔒 Lock Codeshare Routes",
+            )
+        )
 
 class ROTWPreviewView(discord.ui.View):
-    def __init__(self, routes: list[dict], week_start: str):
+    def __init__(
+        self,
+        routes: list[dict],
+        week_start: str,
+        locked_indices: set[int] | None = None,
+    ):
         super().__init__(timeout=600)
+
         self.routes = routes
         self.week_start = week_start
+        self.posted = False
+
+        self.locked_indices = locked_indices or set()
+
+        self.locked_ajet_indices = {
+            index
+            for index in self.locked_indices
+            if self.routes[index].get("source", "").lower() == "ajet"
+        }
+
+        self.locked_codeshare_indices = {
+            index
+            for index in self.locked_indices
+            if self.routes[index].get("source", "").lower() == "codeshare"
+        }
+
+        # AJet reroll
+        self.add_item(
+            ROTWRouteSelect(
+                self,
+                source="ajet",
+                placeholder="✈️ Reroll an AJet route",
+            )
+        )
+
+        # Codeshare reroll - any partner
+        self.add_item(
+            ROTWRouteSelect(
+                self,
+                source="codeshare",
+                placeholder="🤝 Reroll Codeshare — Any Partner",
+            )
+        )
+
+        # Codeshare reroll - same partner
+        self.add_item(
+            ROTWSamePartnerSelect(
+                self,
+                placeholder="🔒 Reroll Codeshare — Same Partner",
+            )
+        )
+
+
+    @discord.ui.button(
+        label="Manage Locks",
+        style=discord.ButtonStyle.secondary,
+        emoji="🔒",
+    )
+    async def manage_locks_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        if not await require_rotw_staff(interaction):
+            return
+
+        lock_view = ROTWLockManagementView(self)
+
+        await interaction.response.send_message(
+            f"🔒 **Route Locks**\n"
+            f"Currently locked: **{len(self.locked_indices)} route(s)**\n\n"
+            f"Choose the routes you want to preserve when regenerating.",
+            view=lock_view,
+            ephemeral=True,
+        )
+
+
+    async def reroll_single_route(
+        self,
+        interaction: discord.Interaction,
+        route_index: int,
+    ):
+        try:
+            new_route = await get_single_reroll(
+                self.routes,
+                route_index,
+            )
+
+            if new_route is None:
+                await interaction.followup.send(
+                    "Unable to find a replacement route.",
+                    ephemeral=True,
+                )
+                return
+
+            self.routes[route_index] = new_route
+
+            embed = format_rotw_embed(
+                self.routes,
+                self.week_start,
+            )
+
+            embed.insert_field_at(
+                0,
+                name="📊 Preview Summary",
+                value=get_rotw_preview_summary(self.routes),
+                inline=False,
+            )
+
+            new_view = ROTWPreviewView(
+                self.routes,
+                self.week_start,
+                locked_indices=self.locked_indices,
+            )
+
+            await interaction.edit_original_response(
+                content="Generated a new ROTW preview.",
+                embed=embed,
+                view=new_view,
+            )
+
+            await interaction.followup.send(
+                "✅ Preview regenerated successfully.",
+                ephemeral=True,
+            ) 
+
+        except Exception as e:
+            logger.exception(
+                "Error rerolling individual ROTW route"
+            )
+
+            await interaction.followup.send(
+                f"Unable to reroll route: `{e}`",
+                ephemeral=True,
+            )
+
 
     @discord.ui.button(
         label="Post ROTW",
@@ -576,12 +1132,25 @@ class ROTWPreviewView(discord.ui.View):
         if not await require_rotw_staff(interaction):
             return
 
+        # Prevent the same preview being posted twice
+        if self.posted:
+            await interaction.response.send_message(
+                "⚠️ This ROTW preview has already been posted.",
+                ephemeral=True,
+            )
+            return
+
+        # Lock immediately so a rapid second click cannot post again
+        self.posted = True
+
         await interaction.response.defer(ephemeral=True)
 
         try:
             channel = bot.get_channel(ROTW_CHANNEL_ID)
 
             if channel is None:
+                self.posted = False
+
                 await interaction.followup.send(
                     "Unable to find the ROTW channel.",
                     ephemeral=True,
@@ -594,18 +1163,39 @@ class ROTWPreviewView(discord.ui.View):
                 self.week_start,
             )
 
+            # Disable every control on this preview after posting
+            for item in self.children:
+                item.disabled = True
+
+            button.label = "ROTW Posted"
+            button.emoji = "✅"
+
+            await interaction.followup.edit_message(
+                interaction.message.id,
+                view=self,
+            )
+
             await interaction.followup.send(
-                "ROTW posted successfully.",
+                "✅ ROTW posted successfully. This preview is now locked.",
+                ephemeral=True,
+            )
+
+        except ValueError as e:
+            await interaction.followup.send(
+                f"⚠️ {e}",
                 ephemeral=True,
             )
 
         except Exception as e:
-            logger.exception("Error posting ROTW from preview")
+            logger.exception(
+                "Error posting ROTW from preview"
+            )
 
             await interaction.followup.send(
                 f"Unable to post ROTW: `{e}`",
                 ephemeral=True,
             )
+
 
     @discord.ui.button(
         label="Regenerate Preview",
@@ -625,10 +1215,18 @@ class ROTWPreviewView(discord.ui.View):
         try:
             routes, week_start = await generate_rotw()
 
+            # Restore every locked route to its original position
+            for index in self.locked_indices:
+                if index < len(self.routes) and index < len(routes):
+                    routes[index] = self.routes[index]
+
             self.routes = routes
             self.week_start = week_start
 
-            embed = format_rotw_embed(routes, week_start)
+            embed = format_rotw_embed(
+                routes,
+                week_start,
+            )
 
             embed.insert_field_at(
                 0,
@@ -637,14 +1235,28 @@ class ROTWPreviewView(discord.ui.View):
                 inline=False,
             )
 
-            await interaction.edit_original_response(
+            new_view = ROTWPreviewView(
+                routes,
+                week_start,
+                locked_indices=self.locked_indices,
+            )
+
+            await interaction.followup.edit_message(
+                interaction.message.id,
                 content="Generated a new ROTW preview.",
                 embed=embed,
-                view=self,
+                view=new_view,
+            )
+
+            await interaction.followup.send(
+                "✅ Preview regenerated successfully.",
+                ephemeral=True,
             )
 
         except Exception as e:
-            logger.exception("Error regenerating ROTW preview")
+            logger.exception(
+                "Error regenerating ROTW preview"
+            )
 
             await interaction.followup.send(
                 f"Unable to regenerate preview: `{e}`",
@@ -878,6 +1490,13 @@ async def publish_rotw(
     routes: list[dict],
     week_start: str,
 ) -> discord.Message:
+
+    # Prevent publishing more than one ROTW for the same week
+    if rotw_week_already_posted(week_start):
+        raise ValueError(
+            f"ROTW for week {week_start} has already been posted."
+        )
+
     embed = format_rotw_embed(routes, week_start)
 
     content = f"<@&{ROTW_ROLE_ID}>" if ROTW_ROLE_ID else None
@@ -896,9 +1515,15 @@ async def publish_rotw(
         try:
             await msg.add_reaction(reaction)
         except discord.HTTPException:
-            logger.warning("Failed to add reaction %s", reaction)
+            logger.warning(
+                "Failed to add reaction %s",
+                reaction,
+            )
 
-    save_rotw_history(week_start, routes)
+    save_rotw_history(
+        week_start,
+        routes,
+    )
 
     return msg
 
